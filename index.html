@@ -427,6 +427,8 @@
             transition: transform 0.3s ease;
         }
 
+        .notification {max-width:calc(100vw - 40px);box-sizing:border-box;overflow-wrap:anywhere;}
+        .notification.error {background:#b42318;}
         .notification.show {
             transform: translateX(0);
         }
@@ -815,6 +817,8 @@
         let students = [];
         let paymentRecords = [];
         let excelWorkbook = null;
+        let editingIncomeId = null;
+        let editingExpenseId = null;
 
         function escapeHtml(value) {
             return String(value ?? '')
@@ -827,13 +831,14 @@
 
         function formatAmount(value) {
             const amount = Number(value) || 0;
-            return Math.round(amount).toLocaleString('zh-TW');
+            return amount.toLocaleString('zh-TW', {maximumFractionDigits: 2});
         }
 
         function getCurrentData() {
             return {
                 appName: '班費收支記帳程式',
-                version: '2026.06-json-excel',
+                version: '2026.10-ledger-v2',
+                accountingVersion: 2,
                 incomeData,
                 expenseData,
                 students,
@@ -843,10 +848,12 @@
         }
 
         function applyData(data) {
-            incomeData = Array.isArray(data.incomeData) ? data.incomeData : [];
-            expenseData = Array.isArray(data.expenseData) ? data.expenseData : [];
-            students = Array.isArray(data.students) ? data.students : [];
-            paymentRecords = Array.isArray(data.paymentRecords) ? data.paymentRecords : [];
+            const normalized = normalizeAccountData(data);
+            incomeData = normalized.incomeData;
+            expenseData = normalized.expenseData;
+            students = normalized.students;
+            paymentRecords = normalized.paymentRecords;
+            editingIncomeId = editingExpenseId = null;
 
             updateIncomeTable();
             updateExpenseTable();
@@ -1267,7 +1274,10 @@
                 return;
             }
             
-            paymentRecords.push({ student, date, amount });
+            if (!student || !validAmount(amount)) { showNotification('學生或金額不正確', 'error'); return; }
+            if (paymentRecords.some(p => p.student === student && p.date === date && moneyCents(p.amount) === moneyCents(amount)) &&
+                !confirm('同一學生當日已有同額繳費。確定這是另一筆實際繳費嗎？')) return;
+            paymentRecords.push({ id: accountId('payment'), student, date, amount });
             paymentRecords.sort((a, b) => new Date(b.date) - new Date(a.date));
             
             updatePaymentRecordsTable();
@@ -1282,6 +1292,9 @@
 
         // 刪除繳費記錄
         function deletePayment(index) {
+            if (incomeData.some(row => (row.linkedPaymentIds || []).includes(paymentRecords[index]?.id))) {
+                showNotification('此繳費已連結舊收入，請先在對帳區解除連結或刪除對應收入，再刪除此繳費。', 'error'); return;
+            }
             if (confirm('確定要刪除這筆繳費記錄嗎？')) {
                 paymentRecords.splice(index, 1);
                 updatePaymentRecordsTable();
@@ -1386,19 +1399,21 @@
             const note = document.getElementById('incomeNote').value.trim();
             const photo = document.getElementById('incomePhoto').src;
             
-            if (!date || !item || !amount || amount <= 0) {
+            if (!date || !item || !validAmount(amount)) {
                 showNotification('請填寫所有必要欄位', 'error');
                 return;
             }
             
-            incomeData.push({
-                id: Date.now(),
-                date, 
-                item, 
-                amount, 
-                note, 
-                photo: photo !== window.location.href ? photo : ''
-            });
+            const oldIndex = incomeData.findIndex(row => row.id === editingIncomeId);
+            const previous = oldIndex >= 0 ? incomeData[oldIndex] : {};
+            if ((previous.linkedPaymentIds || []).length && moneyCents(amount) !== moneyCents(previous.amount)) {
+                showNotification('請先解除舊收入的繳費連結，再修改金額。', 'error'); return;
+            }
+            const entry = { ...previous, id: editingIncomeId || accountId('income'), date, item, amount, note,
+                photo: photo !== window.location.href ? photo : '' };
+            if (oldIndex >= 0) incomeData[oldIndex] = entry;
+            else incomeData.push(entry);
+            editingIncomeId = null;
             
             incomeData.sort((a, b) => new Date(b.date) - new Date(a.date));
             updateIncomeTable();
@@ -1421,19 +1436,21 @@
             const note = document.getElementById('expenseNote').value.trim();
             const photo = document.getElementById('expensePhoto').src;
             
-            if (!date || !item || !amount || amount <= 0) {
+            if (!date || !item || !validAmount(amount)) {
                 showNotification('請填寫所有必要欄位', 'error');
                 return;
             }
             
-            expenseData.push({
-                id: Date.now(),
-                date, 
-                item, 
-                amount, 
-                note, 
-                photo: photo !== window.location.href ? photo : ''
-            });
+            const oldIndex = expenseData.findIndex(row => row.id === editingExpenseId);
+            const previous = oldIndex >= 0 ? expenseData[oldIndex] : {};
+            if ((previous.linkedPaymentIds || []).length && moneyCents(amount) !== moneyCents(previous.amount)) {
+                showNotification('請先解除舊收入的繳費連結，再修改金額。', 'error'); return;
+            }
+            const entry = { ...previous, id: editingExpenseId || accountId('expense'), date, item, amount, note,
+                photo: photo !== window.location.href ? photo : '' };
+            if (oldIndex >= 0) expenseData[oldIndex] = entry;
+            else expenseData.push(entry);
+            editingExpenseId = null;
             
             expenseData.sort((a, b) => new Date(b.date) - new Date(a.date));
             updateExpenseTable();
@@ -1515,10 +1532,7 @@
             
             tbody.innerHTML = '';
             
-            const allTransactions = [
-                ...incomeData.map(item => ({...item, type: 'income'})),
-                ...expenseData.map(item => ({...item, type: 'expense'}))
-            ].sort((a, b) => new Date(b.date) - new Date(a.date));
+            const allTransactions = accountTransactions().sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
             
             if (allTransactions.length === 0) {
                 emptyState.style.display = 'block';
@@ -1531,12 +1545,12 @@
             // 先計算最終結餘（從最舊的交易開始）
             const sortedForBalance = [...allTransactions].sort((a, b) => new Date(a.date) - new Date(b.date));
             sortedForBalance.forEach(transaction => {
-                const amount = transaction.type === 'income' ? transaction.amount : -transaction.amount;
+                const amount = transaction.type === 'income' ? moneyCents(transaction.amount) : -moneyCents(transaction.amount);
                 balance += amount;
             });
             
             // 然後從最新的交易開始顯示，並倒推結餘
-            let currentBalance = balance;
+            let currentBalance = balance / 100;
             allTransactions.forEach(transaction => {
                 const amount = transaction.type === 'income' ? transaction.amount : -transaction.amount;
                 const previousBalance = currentBalance - amount;
@@ -1554,19 +1568,21 @@
                     <td style="color: ${balanceColor}; font-weight: bold;">${formatAmount(currentBalance)}</td>
                 `;
                 
-                currentBalance = previousBalance;
+                currentBalance = Math.round(previousBalance * 100) / 100;
             });
         }
 
         // 更新結餘摘要
         function updateBalanceSummary() {
-            const totalIncome = incomeData.reduce((sum, item) => sum + item.amount, 0);
-            const totalExpense = expenseData.reduce((sum, item) => sum + item.amount, 0);
-            const currentBalance = totalIncome - totalExpense;
+            const ledger = accountTransactions();
+            const totalIncome = ledger.filter(t => t.type === 'income').reduce((sum, t) => sum + moneyCents(t.amount), 0) / 100;
+            const totalExpense = ledger.filter(t => t.type === 'expense').reduce((sum, t) => sum + moneyCents(t.amount), 0) / 100;
+            const currentBalance = Math.round((totalIncome - totalExpense) * 100) / 100;
             
             document.getElementById('totalIncome').textContent = formatAmount(totalIncome);
             document.getElementById('totalExpense').textContent = formatAmount(totalExpense);
-            document.getElementById('currentBalance').textContent = formatAmount(currentBalance);
+            document.getElementById('currentBalance').textContent = formatAmount(currentBalance) + (pendingReconciliations().length ? '（待對帳）' : '');
+            renderReconciliation();
             
             // 根據結餘改變顏色
             const balanceElement = document.getElementById('currentBalance');
@@ -1611,12 +1627,12 @@
                 document.getElementById('incomePhoto').style.display = 'block';
             }
             
-            // 刪除原記錄
-            incomeData.splice(index, 1);
+            // 原記錄保留到修改成功，避免取消或關頁造成遺失。
+            editingIncomeId = income.id;
             updateIncomeTable();
             updateBalanceTable();
             
-            showNotification('請修改資料後重新新增');
+            showNotification('修改後按新增即可更新原記錄；提交前原記錄會保留。');
         }
 
         // 編輯支出記錄
@@ -1633,12 +1649,12 @@
                 document.getElementById('expensePhoto').style.display = 'block';
             }
             
-            // 刪除原記錄
-            expenseData.splice(index, 1);
+            // 原記錄保留到修改成功，避免取消或關頁造成遺失。
+            editingExpenseId = expense.id;
             updateExpenseTable();
             updateBalanceTable();
             
-            showNotification('請修改資料後重新新增');
+            showNotification('修改後按新增即可更新原記錄；提交前原記錄會保留。');
         }
 
         // 檔案管理
@@ -1650,7 +1666,7 @@
                 const key = localStorage.key(i);
                 if (key.startsWith('classAccount_')) {
                     const displayName = key.replace('classAccount_', '');
-                    fileList.innerHTML += `<option value="${key}">${displayName}</option>`;
+                    fileList.innerHTML += `<option value="${escapeHtml(key)}">${escapeHtml(displayName)}</option>`;
                 }
             }
         }
@@ -1664,16 +1680,8 @@
             
             showLoading();
             
-            const data = {
-                appName: '班費收支記帳程式',
-                version: '2026.06-json-excel',
-                incomeData,
-                expenseData,
-                students,
-                paymentRecords,
-                savedAt: new Date().toISOString()
-            };
-            
+            const data = getCurrentData();
+
             setTimeout(() => {
                 try {
                     const key = `classAccount_${fileName}`;
@@ -1927,6 +1935,152 @@
             }
         });
     </script>
+<script>
+// Accounting repair v2: payments are ledger income, never copied into incomeData.
+const ACCOUNT_CURRENT_KEY = 'lssh.classAccount.current.v2';
+let accountRevision = 0;
+let accountWriteBlocked = false;
+function accountId(type) { return type + '-' + crypto.randomUUID(); }
+function moneyCents(value) { return Math.round(Number(value) * 100); }
+function validAmount(value) { return Number.isFinite(Number(value)) && Number(value) > 0 && Number.isSafeInteger(moneyCents(value)) && Math.abs(Number(value) * 100 - moneyCents(value)) < 0.00001; }
+function normalizeAccountData(data) {
+    if (!data || !['students', 'paymentRecords', 'incomeData', 'expenseData'].every(key => Array.isArray(data[key]))) throw new Error('班費資料缺少必要清單，未套用');
+    const normalize = (rows, kind) => {
+        const seen = new Set();
+        return rows.map((row, i) => {
+            if (!row || typeof row !== 'object' || !validAmount(row.amount) || typeof row.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(row.date) || Number.isNaN(Date.parse(row.date))) throw new Error(`第 ${i + 1} 筆${kind}日期或金額不正確，未套用`);
+            if (kind === 'payment' ? typeof row.student !== 'string' : typeof row.item !== 'string') throw new Error('帳務文字欄位不正確，未套用');
+            const id = String(row.id ?? `${kind}-legacy-${i}-${row.date}-${moneyCents(row.amount)}`);
+            if (seen.has(id)) throw new Error('帳目識別碼重複，未套用');
+            seen.add(id);
+            if (row.linkedPaymentIds !== undefined && (!Array.isArray(row.linkedPaymentIds) || row.linkedPaymentIds.some(id => typeof id !== 'string'))) throw new Error('繳費對帳格式不正確');
+            return { ...row, id, amount: Number(row.amount) };
+        });
+    };
+    if (data.students.some(name => typeof name !== 'string')) throw new Error('學生名單格式不正確');
+    return { students: data.students.slice(), paymentRecords: normalize(data.paymentRecords, 'payment'), incomeData: normalize(data.incomeData, 'income'), expenseData: normalize(data.expenseData, 'expense') };
+}
+function ensureAccountIds() {
+    for (const [rows, kind] of [[paymentRecords, 'payment'], [incomeData, 'income'], [expenseData, 'expense']]) {
+        rows.forEach(row => { row.id = String(row.id ?? accountId(kind)); });
+    }
+}
+function validPaymentLink(income) {
+    const ids = income.linkedPaymentIds || [];
+    if (!ids.length || new Set(ids).size !== ids.length) return false;
+    const rows = ids.map(id => paymentRecords.find(row => row.id === id));
+    return rows.every(Boolean) && rows.reduce((n, row) => n + moneyCents(row.amount), 0) === moneyCents(income.amount) &&
+        !incomeData.some(other => other !== income && (other.linkedPaymentIds || []).some(id => ids.includes(id)));
+}
+function pendingReconciliations() {
+    return incomeData.filter(income => {
+        if ((income.linkedPaymentIds || []).length) return !validPaymentLink(income);
+        if (income.reconciliationDecision === 'independent') return false;
+        return paymentRecords.length && (
+            /班費|繳費|學生收款/.test(income.item + ' ' + (income.note || '')) ||
+            paymentRecords.some(p => p.date === income.date && moneyCents(p.amount) === moneyCents(income.amount)) ||
+            paymentRecords.filter(p => p.date === income.date).reduce((n, p) => n + moneyCents(p.amount), 0) === moneyCents(income.amount)
+        );
+    });
+}
+function accountTransactions() {
+    ensureAccountIds();
+    return [
+        ...paymentRecords.map(p => ({ ...p, type: 'income', item: `${p.student} 班費繳交`, source: 'payment' })),
+        ...incomeData.filter(row => !validPaymentLink(row)).map(row => ({ ...row, type: 'income', source: 'other' })),
+        ...expenseData.map(row => ({ ...row, type: 'expense', source: 'expense' }))
+    ];
+}
+function renderReconciliation() {
+    const panel = document.getElementById('accountReconciliation');
+    if (!panel) return;
+    const pending = pendingReconciliations();
+    const linked = incomeData.filter(row => (row.linkedPaymentIds || []).length);
+    panel.replaceChildren();
+    const heading = document.createElement('h3');
+    heading.textContent = pending.length ? `⚠ ${pending.length} 筆收入待對帳（目前結餘為暫算）` : '✓ 繳費已納入結餘';
+    panel.append(heading);
+    const hint = document.createElement('p');
+    hint.textContent = '學生繳費自動計入收入。舊收入若重複記錄同一筆繳費，請勾選對應紀錄後連結；原收入會保留，但只計算一次。不同的實際收入請標記為獨立收入。';
+    panel.append(hint);
+    const rows = [...new Set([...pending, ...linked])];
+    rows.forEach(income => {
+        const box = document.createElement('details'); box.open = pending.includes(income);
+        const title = document.createElement('summary');
+        title.textContent = `${income.date}｜${income.item}｜$${formatAmount(income.amount)}｜${validPaymentLink(income) ? '已連結繳費，不重複計入' : '待確認'}`;
+        box.append(title);
+        const candidates = document.createElement('div'); candidates.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;margin:12px 0';
+        paymentRecords.forEach(payment => {
+            const label = document.createElement('label'); label.style.cssText = 'display:flex;align-items:center;gap:6px';
+            const input = document.createElement('input'); input.type = 'checkbox'; input.value = payment.id;
+            input.checked = (income.linkedPaymentIds || []).includes(payment.id);
+            label.append(input, `${payment.date} ${payment.student} $${formatAmount(payment.amount)}`); candidates.append(label);
+        });
+        box.append(candidates);
+        const link = document.createElement('button'); link.className = 'btn'; link.textContent = '確認為勾選繳費的重複收入';
+        link.onclick = () => reconcileIncome(income.id, [...candidates.querySelectorAll('input:checked')].map(el => el.value));
+        const independent = document.createElement('button'); independent.className = 'btn'; independent.textContent = '確認為獨立收入／解除連結';
+        independent.onclick = () => reconcileIncome(income.id, []);
+        box.append(link, ' ', independent); panel.append(box);
+    });
+}
+function reconcileIncome(id, paymentIds) {
+    const income = incomeData.find(row => row.id === id); if (!income) return;
+    if (paymentIds.length) {
+        const rows = paymentIds.map(id => paymentRecords.find(row => row.id === id));
+        if (new Set(paymentIds).size !== paymentIds.length || !rows.every(Boolean) || rows.reduce((n, p) => n + moneyCents(p.amount), 0) !== moneyCents(income.amount)) { showNotification('勾選的繳費加總必須等於此筆收入，未變更資料。', 'error'); return; }
+        if (incomeData.some(other => other !== income && (other.linkedPaymentIds || []).some(id => paymentIds.includes(id)))) { showNotification('同筆繳費已連結另一筆收入，請先解除舊連結。', 'error'); return; }
+    }
+    income.linkedPaymentIds = paymentIds;
+    income.reconciliationDecision = paymentIds.length ? 'linked' : 'independent';
+    income.reconciledAt = new Date().toISOString();
+    refreshAccount(); persistAccount();
+    showNotification('對帳設定已更新，原紀錄保留。');
+}
+function refreshAccount() { updateBalanceTable(); updateBalanceSummary(); }
+function accountStatus(text) { const el = document.getElementById('accountSaveState'); if (el) el.textContent = text; }
+function persistAccount() {
+    if (accountWriteBlocked) { accountStatus('⚠ 未儲存：其他分頁已更新，請先下載 JSON 備份本頁，再重新整理。'); return false; }
+    try {
+        const stored = JSON.parse(localStorage.getItem(ACCOUNT_CURRENT_KEY) || 'null');
+        if ((stored?.revision || 0) !== accountRevision) { accountWriteBlocked = true; accountStatus('⚠ 未儲存：其他分頁已更新，請備份本頁後重新整理。'); return false; }
+        const next = accountRevision + 1;
+        localStorage.setItem(ACCOUNT_CURRENT_KEY, JSON.stringify({ revision: next, data: getCurrentData() }));
+        accountRevision = next; accountStatus('✓ 目前工作區已自動儲存（重要帳務仍請下載 JSON 備份）'); return true;
+    } catch (error) { accountStatus('⚠ 未儲存：' + error.message + '。請下載 JSON 保留畫面資料。'); return false; }
+}
+// Mutations refresh the same ledger and preserve current work automatically.
+for (const name of ['addPayment', 'deletePayment', 'addIncome', 'addExpense', 'deleteIncome', 'deleteExpense', 'applyData', 'clearAllData', 'processStudentNames', 'importSelectedSheet']) {
+    const original = window[name];
+    window[name] = function(...args) {
+        const before = JSON.stringify(getCurrentData(), (key, value) => key === 'exportedAt' ? undefined : value);
+        const result = original.apply(this, args);
+        const after = JSON.stringify(getCurrentData(), (key, value) => key === 'exportedAt' ? undefined : value);
+        refreshAccount();
+        if (before !== after) persistAccount();
+        return result;
+    };
+}
+const originalGetAccountData = getCurrentData;
+getCurrentData = function() { ensureAccountIds(); return originalGetAccountData(); };
+document.addEventListener('DOMContentLoaded', () => {
+    const status = document.createElement('p'); status.id = 'accountSaveState'; status.setAttribute('role', 'status');
+    document.querySelector('.container').append(status);
+    const panel = document.createElement('section'); panel.id = 'accountReconciliation';
+    panel.style.cssText = 'padding:16px;margin:16px 0;border:1px solid #d9b45b;border-radius:12px;background:#fff9e9;overflow-wrap:anywhere';
+    document.getElementById('Balance').prepend(panel);
+    try {
+        const stored = JSON.parse(localStorage.getItem(ACCOUNT_CURRENT_KEY) || 'null');
+        accountRevision = stored?.revision || 0;
+        if (stored) applyData(stored.data);
+        else { refreshAccount(); accountStatus('新工作區；修改後自動儲存。'); }
+    } catch (error) { accountWriteBlocked = true; accountStatus('⚠ 舊工作區格式無法載入，原資料保留；請從命名檔案或 JSON 還原。'); }
+});
+window.addEventListener('storage', event => {
+    if (event.key === ACCOUNT_CURRENT_KEY) { accountWriteBlocked = true; accountStatus('⚠ 其他分頁已更新，請下載本頁 JSON 後重新整理。'); }
+});
+
+</script>
 </body>
 </html>
                 
